@@ -10,7 +10,7 @@ const HEADER_FILES: &[&str] = &[
 ];
 
 fn main() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let lib = out_dir.join("lib");
     let include = out_dir.join("include");
 
@@ -35,5 +35,6 @@ fn main() {
 
     cfg.compile("nfnetlink");
 
+    println!("cargo:root={}", out_dir.display());
     println!("cargo:include={}", include.display());
 }

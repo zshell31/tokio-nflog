@@ -1,4 +1,5 @@
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, non_upper_case_globals)]
 
-include!("./bindings.rs");
+use libc::{iovec, msghdr, nlmsghdr, pid_t, sockaddr_nl};
+
+include!("bindings.rs");

@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../tokio"
+		},
+		{
+			"path": "../../mio"
+		}
+	],
+	"settings": {}
+}

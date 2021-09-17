@@ -1,13 +1,22 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const C_FILES: &[&str] = &["libnetfilter_log.c"];
+const HEADER_FILES: &[&str] = &["libipulog.h", "libnetfilter_log.h", "linux_nfnetlink_log.h"];
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let lib = out_dir.join("lib");
+    let include = out_dir.join("include");
 
     let dir = Path::new("src/libnetfilter_log");
+    let include_dir = dir.join("include/libnetfilter_log");
+    fs::create_dir_all(&include).unwrap();
+    for &header in HEADER_FILES {
+        fs::copy(include_dir.join(header), include.join(header)).unwrap();
+    }
+
     let src = dir.join("src");
     let mut cfg = cc::Build::new();
     cfg.out_dir(&lib)
@@ -19,13 +28,12 @@ fn main() {
         cfg.file(src.join(file));
     }
 
-    println!("here: {:#?}", env::vars().into_iter().collect::<Vec<_>>());
-    if let Ok(nfnetlink_include) = env::var("DEP_NFNETLINK_INCLUDE") {
-        println!("got env");
+    if let Some(nfnetlink_include) = env::var_os("DEP_NFNETLINK_INCLUDE") {
         cfg.include(&nfnetlink_include);
     }
 
     cfg.compile("netfilter_log");
 
-    println!("cargo:rustc-link-lib=static=nfnetlink");
+    println!("cargo:root={}", out_dir.display());
+    println!("cargo:include={}", include.display());
 }
