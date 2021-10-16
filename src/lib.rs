@@ -79,10 +79,16 @@ impl QueueConfig {
 }
 
 pub struct Queue<H> {
-    pub(crate) handle: QueueHandle,
-    pub(crate) handler: NonNull<H>,
-    pub(crate) config: QueueConfig,
+    handle: QueueHandle,
+    handler: NonNull<H>,
+    config: QueueConfig,
 }
+
+// Handler is only used in callback, but not in Queue/Socket itself.
+// So it's safe to share pointer to handler with callback.
+// TODO:
+// restrict access to handler inside Queue/Socket at type level
+unsafe impl<H> Send for Queue<H> {}
 
 impl<H> Queue<H>
 where
