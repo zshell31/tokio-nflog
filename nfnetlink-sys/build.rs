@@ -1,3 +1,4 @@
+use std::convert::AsRef;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,11 @@ const HEADER_FILES: &[&str] = &[
 ];
 
 fn main() {
+    // TODO: check linux target
+    // TODO: git submodule update --init
+    // TODO: pkg_config
+    // TODO: generating bindings
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let lib = out_dir.join("lib");
     let include = out_dir.join("include");
@@ -37,4 +43,16 @@ fn main() {
 
     println!("cargo:root={}", out_dir.display());
     println!("cargo:include={}", include.display());
+
+    rerun_if("src/libnfnetlink");
+}
+
+fn rerun_if<P: AsRef<Path>>(path: P) {
+    if path.as_ref().is_dir() {
+        for entry in fs::read_dir(path).expect("read_dir") {
+            rerun_if(&entry.expect("entry").path());
+        }
+    } else {
+        println!("cargo:rerun-if-changed={}", path.as_ref().display());
+    }
 }

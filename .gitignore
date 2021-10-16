@@ -1,1 +1,3 @@
 /target
+cscope.out
+*.code-workspace

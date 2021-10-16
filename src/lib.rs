@@ -1,17 +1,30 @@
+#[macro_use]
+mod macros;
+
 mod message;
+mod queue_handle;
 
 use bitflags::bitflags;
+use bytes::{BufMut, BytesMut};
+use futures::{future, ready};
 use nflog_sys::*;
-use std::io::{self, Read};
-use std::marker::PhantomData;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::prelude::FromRawFd;
 use std::ptr::NonNull;
-use tokio::io::unix::AsyncFd;
+use std::task::{Context, Poll};
+use std::{io, mem::MaybeUninit};
+use tokio::io::ReadBuf;
+use tokio::net::UnixDatagram as TokioUnixDatagram;
 
-pub use message::Message;
+use queue_handle::QueueHandle;
 
+pub use message::{L3Protocol, Message, MessageHandler};
+pub use nix::sys::socket::AddressFamily;
+pub use pnet_base::MacAddr;
+
+const NFLOG_BUF_SIZE: usize = 150000;
+
+#[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum CopyMode {
     /// Do not copy packet contents nor metadata
@@ -25,133 +38,198 @@ pub enum CopyMode {
 bitflags! {
     /// Configuration Flags
     pub struct Flags: u16 {
-        const Sequence = NFULNL_CFG_F_SEQ;
-        const GlobalSequence = NFULNL_CFG_F_SEQ_GLOBAL;
+        const SEQUENCE = NFULNL_CFG_F_SEQ;
+        const GLOBAL_SEQUENCE = NFULNL_CFG_F_SEQ_GLOBAL;
     }
 }
 
-#[derive(Debug)]
-pub struct Queue {
-    handle: NonNull<nflog_handle>,
+pub struct QueueConfig {
+    pub address_families: Vec<AddressFamily>,
+    pub group_num: u16,
+    pub buffer_size: usize,
+    pub unbind: bool,
+
+    pub copy_mode: Option<CopyMode>,
+    pub range: Option<u32>,
+    pub flags: Option<Flags>,
 }
 
-macro_rules! wrap_in_result {
-    ($e:expr) => {{
-        let result = unsafe { $e };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            address_families: vec![AddressFamily::Inet, AddressFamily::Inet6],
+            group_num: 0,
+            buffer_size: NFLOG_BUF_SIZE,
+            unbind: false,
+
+            copy_mode: None,
+            range: None,
+            flags: None,
         }
-    }};
+    }
 }
 
-impl Queue {
-    pub fn open() -> io::Result<Self> {
-        let handle = unsafe { nflog_open() };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
+impl QueueConfig {
+    pub fn build<H>(self, handler: H) -> io::Result<Queue<H>>
+    where
+        H: MessageHandler,
+    {
+        Queue::create(self, handler)
+    }
+}
+
+pub struct Queue<H> {
+    pub(crate) handle: QueueHandle,
+    pub(crate) handler: NonNull<H>,
+    pub(crate) config: QueueConfig,
+}
+
+impl<H> Queue<H>
+where
+    H: MessageHandler,
+{
+    pub fn create(config: QueueConfig, handler: H) -> io::Result<Self> {
+        let mut handle = QueueHandle::open()?;
+
+        for address_family in &config.address_families {
+            if config.unbind {
+                handle.unbind(*address_family)?;
+            }
+            handle.bind(*address_family)?;
         }
 
-        Ok(Queue {
-            handle: unsafe { NonNull::new_unchecked(handle) },
+        handle.bind_group(config.group_num)?;
+
+        let handler = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(handler))) };
+
+        let mut queue = Self {
+            handle,
+            config,
+            handler,
+        };
+
+        if let (Some(mode), Some(range)) = (queue.config.copy_mode, queue.config.range) {
+            queue.set_mode(mode, range)?;
+        }
+        if let Some(flags) = queue.config.flags {
+            queue.set_flags(flags)?;
+        }
+
+        Ok(queue)
+    }
+
+    pub fn config(&self) -> &QueueConfig {
+        &self.config
+    }
+
+    pub fn set_mode(&mut self, mode: CopyMode, range: u32) -> io::Result<()> {
+        self.handle.set_mode(mode, range)?;
+        self.config.copy_mode = Some(mode);
+        self.config.range = Some(range);
+
+        Ok(())
+    }
+
+    pub fn set_flags(&mut self, flags: Flags) -> io::Result<()> {
+        self.handle.set_flags(flags)?;
+        self.config.flags = Some(flags);
+
+        Ok(())
+    }
+
+    pub fn socket(self) -> io::Result<QueueSocket<H>> {
+        self.register_callback()?;
+        QueueSocket::new(self)
+    }
+
+    fn register_callback(&self) -> io::Result<()> {
+        let group_handle = self.handle.group_handle()?;
+        let handler = self.handler.as_ptr();
+
+        unsafe {
+            nflog_callback_register(
+                group_handle.as_ptr(),
+                Some(callback::<H>),
+                handler as *mut _,
+            )
+        };
+
+        Ok(())
+    }
+}
+
+pub struct QueueSocket<H> {
+    socket: TokioUnixDatagram,
+    queue: Queue<H>,
+    buffer: BytesMut,
+}
+
+impl<H> QueueSocket<H> {
+    fn new(queue: Queue<H>) -> io::Result<Self> {
+        let fd = queue.handle.fd();
+        let socket = unsafe { UnixDatagram::from_raw_fd(fd) };
+        let socket = TokioUnixDatagram::from_std(socket)?;
+
+        let buffer = BytesMut::with_capacity(queue.config.buffer_size);
+
+        Ok(Self {
+            socket,
+            queue,
+            buffer,
         })
     }
 
-    pub fn unbind(&self, protocol_family: libc::c_int) -> io::Result<()> {
-        wrap_in_result!(nflog_unbind_pf(
-            self.handle.as_ptr(),
-            protocol_family as u16
-        ))
-    }
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.buffer.clear();
 
-    pub fn bind(&self, protocol_family: libc::c_int) -> io::Result<()> {
-        wrap_in_result!(nflog_bind_pf(self.handle.as_ptr(), protocol_family as u16))
-    }
+        let n = unsafe {
+            let buf = &mut *(self.buffer.chunk_mut() as *mut _ as *mut [MaybeUninit<u8>]);
+            let mut read = ReadBuf::uninit(buf);
+            let ptr = read.filled().as_ptr();
 
-    pub fn bind_group(&self, num: u16) -> io::Result<Group> {
-        let group_handle = unsafe { nflog_bind_group(self.handle.as_ptr(), num) };
-        if group_handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
+            ready!(self.socket.poll_recv(cx, &mut read))?;
 
-        Ok(Group {
-            handle: unsafe { NonNull::new_unchecked(group_handle) },
-            group: num,
-            queue_lifetime: PhantomData,
-            has_callback: false,
-        })
-    }
+            assert_eq!(ptr, read.filled().as_ptr());
 
-    pub fn fd(&self) -> RawFd {
-        unsafe { nflog_fd(self.handle.as_ptr()) }
-    }
+            let n = read.filled().len();
+            self.buffer.advance_mut(n);
+            n
+        };
 
-    pub fn listen(self) -> io::Result<QueueListener> {
-        QueueListener::new(self)
-    }
-
-    pub fn run_loop(&self) -> ! {
-        let fd = self.fd();
-        let mut buf = vec![0u8; 0x10000];
-        let buf_ptr = buf.as_mut_ptr() as *mut libc::c_void;
-        let buf_len = buf.len() as libc::size_t;
-
-        loop {
-            let rc = unsafe { libc::recv(fd, buf_ptr, buf_len, 0) };
-            if rc < 0 {
-                panic!("error in recv: {:?}", ::std::io::Error::last_os_error());
-            };
-
+        if n > 0 {
+            let buf = self.buffer.as_ptr();
             unsafe {
                 nflog_handle_packet(
-                    self.handle.as_ptr(),
-                    buf_ptr as *mut libc::c_char,
-                    rc as libc::c_int,
-                )
+                    self.queue.handle.as_ptr(),
+                    buf as *mut libc::c_char,
+                    n as libc::c_int,
+                );
             };
         }
-    }
-}
 
-impl AsRawFd for Queue {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd()
-    }
-}
-
-pub struct QueueListener {
-    socket: AsyncFd<UnixDatagram>,
-    inner: Queue,
-}
-
-impl QueueListener {
-    fn new(queue: Queue) -> io::Result<Self> {
-        Ok(Self {
-            socket: AsyncFd::new(unsafe { UnixDatagram::from_raw_fd(queue.fd()) })?,
-            inner: queue,
-        })
+        Poll::Ready(Ok(()))
     }
 
-    pub fn into_inner(self) -> Queue {
-        self.inner
+    pub async fn recv(&mut self) -> io::Result<()> {
+        future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    pub async fn recv(&self, out: &mut [u8]) -> io::Result<usize> {
+    pub async fn listen(&mut self) -> io::Result<()> {
         loop {
-            let mut guard = self.socket.readable().await?;
-
-            match guard.try_io(|inner| inner.get_ref().recv(out)) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
+            self.recv().await?;
         }
     }
 }
 
-extern "C" fn callback(
+impl<H> Drop for Queue<H> {
+    fn drop(&mut self) {
+        let _ = unsafe { Box::from_raw(self.handler.as_ptr()) };
+    }
+}
+
+extern "C" fn callback<H: MessageHandler>(
     _gh: *mut nflog_g_handle,
-    _nfmsg: *mut nfgenmsg,
+    nfmsg: *mut nfgenmsg,
     nfd: *mut nflog_data,
     data: *mut std::os::raw::c_void,
 ) -> libc::c_int {
@@ -159,71 +237,25 @@ extern "C" fn callback(
         return 1;
     }
 
-    println!("callback");
-    println!("data: {:p}", data as *const u64);
-    println!("trait obj data: {:#x}", unsafe { *(data as *const u64) });
-    println!("trait obj vtable: {:#x}", unsafe {
-        *(data as *const u64).add(1)
-    });
-
     let result = std::panic::catch_unwind(|| {
-        let boxed_cb = unsafe { Box::from_raw(data as *mut Box<dyn Fn(Message)>) };
-        // println!(
-        //     "boxed: {:p} {}",
-        //     boxed_cb,
-        //     std::mem::size_of::<Box<Box<dyn Fn(Message)>>>()
-        // );
-        let cb = &*boxed_cb;
-        // println!(
-        //     "boxed inner: {:p} {}",
-        //     cb,
-        //     std::mem::size_of::<Box<dyn Fn(Message)>>()
-        // );
+        if nfmsg.is_null() {
+            panic!("nullable nfgenmsg");
+        }
 
-        let msg = unsafe { Message::new(nfd) };
-        cb(msg);
-        //Box::leak(boxed_cb);
+        let nfgenmsg = unsafe { &mut *nfmsg };
+        let msg = match Message::new(nfgenmsg.nfgen_family, nfd) {
+            Ok(msg) => msg,
+            Err(e) => panic!("{}", e),
+        };
+        let mut handler = unsafe { Box::from_raw(data as *mut H) };
+
+        handler.as_mut().handle(msg);
+
+        Box::leak(handler);
     });
 
     match result {
         Ok(_) => 0,
         Err(_) => 1,
-    }
-}
-
-pub struct Group<'a> {
-    handle: NonNull<nflog_g_handle>,
-    group: u16,
-    queue_lifetime: PhantomData<&'a Queue>,
-    has_callback: bool,
-}
-
-impl<'a> Group<'a> {
-    pub fn set_mode(&mut self, mode: CopyMode, range: u32) {
-        unsafe {
-            nflog_set_mode(self.handle.as_ptr(), mode as u8, range);
-        }
-    }
-
-    pub fn set_flags(&mut self, flags: Flags) {
-        unsafe {
-            nflog_set_flags(self.handle.as_ptr(), flags.bits());
-        }
-    }
-
-    pub fn set_callback<F: Fn(Message) + 'static>(&mut self, f: F) {
-        //println!("registration");
-        let boxed_cb = Box::new(f) as Box<dyn Fn(Message)>;
-        //println!("boxed inner: {:p}", boxed_cb);
-        let cb = Box::new(boxed_cb);
-        //println!("boxed: {:p}", cb);
-        unsafe {
-            nflog_callback_register(
-                self.handle.as_ptr(),
-                Some(callback),
-                Box::into_raw(cb) as *mut _,
-            )
-        };
-        self.has_callback = true;
     }
 }

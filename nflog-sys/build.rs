@@ -6,6 +6,11 @@ const C_FILES: &[&str] = &["libnetfilter_log.c"];
 const HEADER_FILES: &[&str] = &["libipulog.h", "libnetfilter_log.h", "linux_nfnetlink_log.h"];
 
 fn main() {
+    // TODO: check linux target
+    // TODO: git submodule update --init
+    // TODO: pkg_config
+    // TODO: generating bindings
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let lib = out_dir.join("lib");
     let include = out_dir.join("include");
