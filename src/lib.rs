@@ -52,6 +52,7 @@ pub struct QueueConfig {
     pub copy_mode: Option<CopyMode>,
     pub range: Option<u32>,
     pub flags: Option<Flags>,
+    pub no_enobufs: Option<bool>,
 }
 
 impl Default for QueueConfig {
@@ -65,6 +66,7 @@ impl Default for QueueConfig {
             copy_mode: None,
             range: None,
             flags: None,
+            no_enobufs: None,
         }
     }
 }
@@ -102,6 +104,10 @@ where
                 handle.unbind(*address_family)?;
             }
             handle.bind(*address_family)?;
+        }
+
+        if let Some(no_enobufs) = config.no_enobufs {
+            handle.set_no_enobufs(no_enobufs)?;
         }
 
         handle.bind_group(config.group_num)?;
