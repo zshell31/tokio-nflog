@@ -1,5 +1,7 @@
+use libc::{c_int, c_void};
 use nflog_sys::*;
 use std::io;
+use std::mem::size_of;
 use std::os::unix::prelude::RawFd;
 use std::ptr::NonNull;
 
@@ -66,6 +68,17 @@ impl QueueHandle {
         let ghandle = self.group_handle()?;
 
         wrap_io_result!(nflog_set_flags(ghandle.as_ptr(), flags.bits()))
+    }
+
+    pub(crate) fn set_no_enobufs(&mut self, no_enobufs: bool) -> io::Result<()> {
+        let option_value: c_int = no_enobufs as c_int;
+        wrap_io_result!(libc::setsockopt(
+            self.fd(),
+            libc::SOL_NETLINK,
+            libc::NETLINK_NO_ENOBUFS,
+            (&option_value as *const c_int) as *const c_void,
+            size_of::<c_int>() as u32,
+        ))
     }
 }
 
